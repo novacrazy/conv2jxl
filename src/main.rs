@@ -57,10 +57,10 @@ pub struct Conv2JxlArgs {
     #[argh(option, default = "1")]
     pub ignore_recent_level: u64,
 
-    /// field to use for sorting files. Default is "ctime" (creation time).
+    /// field to use for sorting files. Default is "mtime" (modification time).
     /// Valid values are "mtime", "ctime", "atime" (modification time, creation time, access time).
     /// This is used to determine which files to ignore with `--ignore-recent`.
-    #[argh(option, default = "String::from(\"ctime\")")]
+    #[argh(option, default = "String::from(\"mtime\")")]
     pub recent_field: String,
 
     /// perform a trial run with no changes made, just print what would be done.
@@ -255,10 +255,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
 
-            // potentially cheaper than a full sort
-            current_files.select_nth_unstable_by_key(args.ignore_recent as usize, |f| ignore_key(&f.metadata).ok());
-
-            current_files.truncate(current_files.len() - args.ignore_recent as usize);
+            let truncate = current_files.len() - args.ignore_recent as usize;
+            current_files.select_nth_unstable_by_key(truncate, |f| ignore_key(&f.metadata).ok());
+            current_files.truncate(truncate);
         }
 
         files.append(&mut current_files);
@@ -275,9 +274,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "asc" => files.sort_by_key(|f| f.metadata.len()),
         "desc" => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.len())),
         "name" => files.sort_by(|a, b| a.path.cmp(&b.path)),
-        "mtime" => files.sort_by_key(|f| f.metadata.modified().ok()),
-        "ctime" => files.sort_by_key(|f| f.metadata.created().ok()),
-        "atime" => files.sort_by_key(|f| f.metadata.accessed().ok()),
+        // most-recent first for these time-based sorts
+        "mtime" => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.modified().ok())),
+        "ctime" => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.created().ok())),
+        "atime" => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.accessed().ok())),
+
         "rand" => {
             use rand::seq::SliceRandom;
             files.shuffle(&mut rand::rng());
