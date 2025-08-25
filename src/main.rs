@@ -9,6 +9,12 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 
+mod enums;
+use enums::{RecentField, SortMethod};
+
+mod formatting;
+use formatting::{format_bytes, format_time};
+
 /// Convert files and directories to JPEG XL format.
 #[derive(argh::FromArgs, Debug)]
 pub struct Conv2JxlArgs {
@@ -46,22 +52,17 @@ pub struct Conv2JxlArgs {
     #[argh(option, short = 'e', default = "9")]
     pub effort: u8,
 
-    /// ignore the N most recent files based on creation time. Default is 0.
-    /// This only applies to the files in the Nth level subdirectories of the given paths,
-    /// where N is specified with `--ignore-recent-level`.
+    /// ignore the N most recent files based on creation time in each directory.
+    /// Only applies if --recurse is set.
     /// This is useful to avoid processing files that archive tools might have created recently.
     #[argh(option, default = "0")]
     pub ignore_recent: u32,
 
-    /// ignore files that are at most N levels deep based on the recent_field.
-    #[argh(option, default = "1")]
-    pub ignore_recent_level: u64,
-
     /// field to use for sorting files. Default is "mtime" (modification time).
     /// Valid values are "mtime", "ctime", "atime" (modification time, creation time, access time).
     /// This is used to determine which files to ignore with `--ignore-recent`.
-    #[argh(option, default = "String::from(\"mtime\")")]
-    pub recent_field: String,
+    #[argh(option, default = "RecentField::default()")]
+    pub recent_field: RecentField,
 
     /// perform a trial run with no changes made, just print what would be done.
     #[argh(switch)]
@@ -93,8 +94,18 @@ pub struct Conv2JxlArgs {
     /// filter input images as comma-separated list of file extensions.
     /// Defaults to "png", which means only PNG files will be processed.
     /// Use "*" to process all supported files.
-    #[argh(option, short = 'f', default = "String::from(\"png\")")]
-    pub filter: String,
+    #[argh(option, long = "ext", default = "String::from(\"png\")")]
+    pub extensions: String,
+
+    /// filter input images by regex pattern on full path.
+    /// Only files matching the pattern will be processed.
+    #[argh(option)]
+    pub filter: Option<String>,
+
+    /// exclude input images by regex pattern on full path.
+    /// Files matching the pattern will be skipped.
+    #[argh(option)]
+    pub exclude: Option<String>,
 
     /// path to error log, for which errors will be appended
     #[argh(option)]
@@ -122,8 +133,8 @@ pub struct Conv2JxlArgs {
     /// sort files before conversion.
     /// Valid values are "none", "asc", "desc", "rand", "name", "mtime", "ctime", "atime".
     /// "asc" and "desc" sort by file size, "rand" sorts randomly. Default is "none".
-    #[argh(option, short = 's', default = "String::from(\"none\")")]
-    pub sort: String,
+    #[argh(option, short = 's', default = "SortMethod::None")]
+    pub sort: SortMethod,
 
     /// paths to files or directories to convert.
     #[argh(positional, greedy)]
@@ -174,20 +185,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     args.threads = args.threads.clamp(-1, i32::MAX);
-
     args.quality = args.quality.clamp(0, 100);
     args.effort = args.effort.clamp(0, 10);
 
-    args.sort = args.sort.to_lowercase();
+    let filter = args.filter.as_ref().map(|s| regex::Regex::new(s)).transpose()?;
+    let exclude = args.exclude.as_ref().map(|s| regex::Regex::new(s)).transpose()?;
 
-    const VALID_SORTS: [&str; 8] = ["none", "asc", "desc", "rand", "name", "mtime", "ctime", "atime"];
-
-    if !VALID_SORTS.contains(&args.sort.as_str()) {
-        eprintln!("Invalid sort option: {}", args.sort);
-        std::process::exit(1);
-    }
-
-    let mut extensions = args.filter.split(',').map(|s| s.trim().as_ref()).collect::<Vec<&OsStr>>();
+    let mut extensions = args.extensions.split(',').map(|s| s.trim().as_ref()).collect::<Vec<&OsStr>>();
 
     extensions.sort_unstable();
     extensions.dedup();
@@ -198,19 +202,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let matches_ext = |path: &Path| all_extensions || extensions.iter().any(|ext| path.extension().is_some_and(|s| s.eq_ignore_ascii_case(ext)));
 
     // setup key extraction for ignoring recent files based on the recent_field argument
-    let ignore_key = match args.recent_field.as_str() {
-        "mtime" => std::fs::Metadata::modified,
-        "ctime" => std::fs::Metadata::created,
-        "atime" => std::fs::Metadata::accessed,
-        _ => {
-            eprintln!("Invalid recent field: {}", args.recent_field);
-            std::process::exit(1);
-        }
+    let ignore_key = match args.recent_field {
+        RecentField::MTime => std::fs::Metadata::modified,
+        RecentField::CTime => std::fs::Metadata::created,
+        RecentField::ATime => std::fs::Metadata::accessed,
     };
-
-    let style = anstyle::Style::new().fg_color(Some(anstyle::AnsiColor::Yellow.into()));
-
-    println!("{style}{args:?}{style:#}");
 
     let error_log = if let Some(ref path) = args.error_log {
         Some(Arc::new(Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(path)?)))
@@ -240,15 +236,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         for entry in std::fs::read_dir(&path)? {
             let entry = entry?;
             let metadata = entry.metadata()?;
+            let path = entry.path();
 
-            if depth >= args.min_depth && metadata.is_file() && matches_ext(&entry.path()) {
-                current_files.push(FileEntry { path: entry.path(), metadata });
+            if (filter.is_some() || exclude.is_some())
+                && let Some(path) = path.to_str()
+            {
+                if matches!(filter, Some(ref filter) if !filter.is_match(path)) {
+                    continue;
+                }
+
+                if matches!(exclude, Some(ref exclude) if exclude.is_match(path)) {
+                    continue;
+                }
+            }
+
+            if depth >= args.min_depth && metadata.is_file() && matches_ext(&path) {
+                current_files.push(FileEntry { path, metadata });
             } else if args.recurse && metadata.is_dir() {
-                pending_dirs.push((depth + 1, entry.path()));
+                pending_dirs.push((depth + 1, path));
             }
         }
 
-        if depth == args.ignore_recent_level && args.ignore_recent > 0 {
+        if args.ignore_recent > 0 {
             // ignore all files if they are all "recent"
             if current_files.len() <= args.ignore_recent as usize {
                 current_files.clear();
@@ -270,20 +279,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    match args.sort.as_str() {
-        "asc" => files.sort_by_key(|f| f.metadata.len()),
-        "desc" => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.len())),
-        "name" => files.sort_by(|a, b| a.path.cmp(&b.path)),
+    match args.sort {
+        SortMethod::None => {}
+        SortMethod::Asc => files.sort_by_key(|f| f.metadata.len()),
+        SortMethod::Desc => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.len())),
+        SortMethod::Name => files.sort_by(|a, b| a.path.cmp(&b.path)),
         // most-recent first for these time-based sorts
-        "mtime" => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.modified().ok())),
-        "ctime" => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.created().ok())),
-        "atime" => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.accessed().ok())),
+        SortMethod::MTime => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.modified().ok())),
+        SortMethod::CTime => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.created().ok())),
+        SortMethod::ATime => files.sort_by_key(|f| std::cmp::Reverse(f.metadata.accessed().ok())),
 
-        "rand" => {
+        SortMethod::Rand => {
             use rand::seq::SliceRandom;
             files.shuffle(&mut rand::rng());
         }
-        _ => {}
     }
 
     if let Some(limit) = args.limit {
@@ -338,8 +347,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let _ = writeln!(
             stdout,
             "   total elapsed time: {}, avg {} per file",
-            format_time(real_start.elapsed().as_millis() as u64),
-            format_time_f64(avg_time)
+            format_time(real_start.elapsed().as_millis() as f64),
+            format_time(avg_time)
         );
 
         let map = ext_progress.load();
@@ -364,7 +373,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let _ = writeln!(
                 stdout,
                 "   - '.{ext}': {i} files, {in_size} to {out_size} ({compression_ratio:.02}%) elapsed {} avg",
-                format_time_f64(avg_time)
+                format_time(avg_time)
             );
         }
 
@@ -488,7 +497,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let dst_size = format_bytes(meta.len());
 
                             if meta.len() > src.metadata.len() {
-                                println!("{warning_style}[{i}/{n}] Warning: Converted file '{dst_leaf}' ({dst_size}) is larger than the original ({src_size}).{warning_style:#}");
+                                println!("{warning_style}[{i}/{n}] Warning: Converted file '{dst_leaf}' ({dst_size}) is larger than the original '{src_ext}' ({src_size}).{warning_style:#}");
 
                                 progress.inefficient();
 
@@ -512,35 +521,28 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                             if args.delete && src.path != output_path {
                                 if let Err(e) = std::fs::remove_file(&src.path) {
-                                    log_error!("Failed to delete {}: {}", src.path.display(), e);
+                                    log_error!("Failed to delete source file {}: {}", src.path.display(), e);
                                 } else {
-                                    println!("{success_style}[{i}/{n}] Successfully converted '{dst_leaf}' {percent:.02}% ({src_size} to {dst_size}) and deleted the '{src_ext}' source file.{success_style}");
+                                    println!("{success_style}[{i}/{n}] Successfully converted '{dst_leaf}' at {percent:.02}% ({src_size} to {dst_size}) and deleted the '{src_ext}' source file.{success_style}");
                                 }
                             } else {
-                                println!("{success_style}[{i}/{n}] Successfully converted '{dst_leaf}' {percent:.02}% ({src_size} to {dst_size}).{success_style:#}");
+                                println!("{success_style}[{i}/{n}] Successfully converted '{dst_leaf}' at {percent:.02}% ({src_size} to {dst_size}).{success_style:#}");
                             }
 
                             let elapsed = start_instant.elapsed().as_millis() as u64;
 
                             // update per-extension progress
-                            {
-                                let map = ext_progress.load();
-
-                                if let Some(progress) = map.get(src_ext) {
-                                    progress.add(src.metadata.len(), meta.len(), elapsed);
-                                } else {
-                                    ext_progress.rcu(|map| {
-                                        let mut map = HashMap::clone(map);
-                                        map.insert(src_ext.to_string(), {
-                                            let progress = Progress::default();
-                                            progress.add(src.metadata.len(), meta.len(), elapsed);
-                                            Arc::new(progress)
-                                        });
-                                        Arc::new(map)
-                                    });
-                                }
+                            if let Some(progress) = ext_progress.load().get(src_ext) {
+                                progress.add(src.metadata.len(), meta.len(), elapsed);
+                            } else {
+                                ext_progress.rcu(|map| {
+                                    let mut map = HashMap::clone(map);
+                                    map.entry(src_ext.to_string()).or_default().add(src.metadata.len(), meta.len(), elapsed);
+                                    Arc::new(map)
+                                });
                             }
 
+                            // update overall progress
                             let processed = progress.add(src.metadata.len(), meta.len(), elapsed);
 
                             #[allow(clippy::collapsible_if)]
@@ -566,39 +568,4 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_progress_report();
 
     Ok(())
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const SUFFIXES: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut size = bytes as f64;
-    let mut suffix_index = 0;
-    while size >= 1024.0 && suffix_index < SUFFIXES.len() - 1 {
-        size /= 1024.0;
-        suffix_index += 1;
-    }
-    format!("{:.2} {}", size, SUFFIXES[suffix_index])
-}
-
-fn format_time(millis: u64) -> String {
-    if millis < 1000 {
-        format!("{}ms", millis)
-    } else if millis < 60_000 {
-        format!("{:.2}s", millis as f64 / 1000.0)
-    } else if millis < 3_600_000 {
-        format!("{:.2}min", millis as f64 / 60_000.0)
-    } else {
-        format!("{:.2}h", millis as f64 / 3_600_000.0)
-    }
-}
-
-fn format_time_f64(millis: f64) -> String {
-    if millis < 1000.0 {
-        format!("{:.2}ms", millis)
-    } else if millis < 60_000.0 {
-        format!("{:.2}s", millis / 1000.0)
-    } else if millis < 3_600_000.0 {
-        format!("{:.2}min", millis / 60_000.0)
-    } else {
-        format!("{:.2}h", millis / 3_600_000.0)
-    }
 }
