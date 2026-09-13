@@ -192,8 +192,12 @@ pub fn evaluate(path: &Path, ext: FileType, size: u64, args: &Conv2JxlArgs) -> V
                 Err(e) => return Verdict::Failed(format!("could not read the JPEG XL header: {e}").into()),
             };
 
-            if !args.reencode_lossy_jxl && source.is_lossy() {
-                return Verdict::AlreadyLossy;
+            if !args.reencode_lossy_jxl {
+                match source.is_lossy() {
+                    Some(true) => return Verdict::AlreadyLossy,
+                    Some(false) => {}
+                    None => return Verdict::Failed("the file ends before its first frame".into()),
+                }
             }
 
             analyze_jxl(source, limits)
@@ -247,7 +251,7 @@ fn decodable(ext: FileType) -> bool {
 /// shelling out to `jxlinfo` a few million times would cost more than all the
 /// real work.
 pub fn is_lossy_jxl(path: &Path) -> Option<bool> {
-    Some(JxlSource::open(path).ok()?.is_lossy())
+    JxlSource::open(path).ok()?.is_lossy()
 }
 
 /// A JPEG XL file with its header decoded and the rest still unread. The
@@ -297,23 +301,68 @@ impl JxlSource {
             match uninit.try_init().map_err(std::io::Error::other)? {
                 InitializeResult::NeedMoreData(need_more) => uninit = need_more,
                 InitializeResult::Initialized(image) => {
-                    return Ok(JxlSource {
+                    let mut source = JxlSource {
                         image,
                         file,
                         buf,
                         valid,
-                    });
+                    };
+                    source.read_first_frame_header()?;
+                    return Ok(source);
                 }
             }
         }
     }
 
-    /// "Lossy" means the codestream is XYB-encoded, which is exactly the test
-    /// `jxlinfo` reports as lossy-versus-"(possibly) lossless": a lossless
-    /// encode keeps the original colour space, so XYB implies the encoder was
-    /// allowed to discard information.
-    fn is_lossy(&self) -> bool {
-        self.image.image_header().metadata.xyb_encoded
+    /// Feed a little past the image header, until the first frame's header
+    /// has been parsed. That is where the encoding (VarDCT or Modular) lives,
+    /// and it sits after the ICC profile and preview, so the bytes that
+    /// initialized the decoder usually stop short of it.
+    fn read_first_frame_header(&mut self) -> std::io::Result<()> {
+        loop {
+            if self.valid > 0 {
+                let consumed = self
+                    .image
+                    .feed_bytes(&self.buf[..self.valid])
+                    .map_err(std::io::Error::other)?;
+                self.buf.copy_within(consumed..self.valid, 0);
+                self.valid -= consumed;
+            }
+
+            if self.image.frame_header(0).is_some() {
+                return Ok(());
+            }
+
+            if self.valid == self.buf.len() {
+                self.buf.resize(self.buf.len() * 2, 0);
+            }
+
+            match self.file.read(&mut self.buf[self.valid..])? {
+                // A file that ends here has no frame. Not an error at this
+                // stage: `is_lossy` reports it as unknown.
+                0 => return Ok(()),
+                read => self.valid += read,
+            }
+        }
+    }
+
+    /// Whether the encoder was allowed to discard information. `None` if the
+    /// file ended before its first frame header.
+    ///
+    /// Two signals, either of which settles it. XYB is the colour space lossy
+    /// encodes work in, and is what `jxlinfo` reports as lossy versus
+    /// "(possibly) lossless". VarDCT is quantized by construction, so a VarDCT
+    /// frame is lossy whatever its colour space: a losslessly recompressed
+    /// JPEG is VarDCT in YCbCr without XYB, and by the first test alone would
+    /// pass as lossless.
+    fn is_lossy(&self) -> Option<bool> {
+        if self.image.image_header().metadata.xyb_encoded {
+            return Some(true);
+        }
+
+        let frame = self.image.frame_header(0)?;
+
+        Some(frame.encoding == jxl_oxide::frame::Encoding::VarDct)
     }
 
     /// Feed the rest of the file and hand back the decoder, ready to render.
