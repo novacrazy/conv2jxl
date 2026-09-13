@@ -154,21 +154,30 @@ pub struct ConversionState {
     /// Notified whenever new files are appended (or shutdown is set). Workers
     /// in watch mode block on this when they've outrun the current list.
     pub wake: (Mutex<()>, Condvar),
-    /// Paths this process has written: conversion outputs and the temp files
-    /// behind an in-place re-encode. The `--watch` promoter treats an event on
-    /// one of these as its own echo rather than as a new file to convert, which
-    /// is what stops a run with `--ext png,jxl` from picking up every `.jxl` it
-    /// just produced. Only populated in watch mode. Nothing else reads it.
+    /// Paths this process writes: every output, and the temp file behind it.
+    ///
+    /// Two jobs. Inserting a final output path is how a worker claims it, so
+    /// two sources that map to the same output (`foo.png` and `foo.jpg` under
+    /// `-X`) cannot both encode into it. And the `--watch` promoter treats an
+    /// event on any of these as its own echo rather than as a new file to
+    /// convert, which is what stops a run with `--ext png,jxl` from picking up
+    /// every `.jxl` it just produced.
     pub produced: Mutex<std::collections::HashSet<PathBuf, foldhash::fast::FixedState>>,
     /// `--log` and `--error-log`, written as each file finishes.
     pub logs: report::Logs,
 }
 
 impl ConversionState {
-    /// Claim a path as our own output before writing to it, so an event for it
-    /// cannot race ahead of the record.
+    /// Claim `path` as this run's output. `false` if another source already
+    /// claimed it, in which case the caller must not write there.
+    pub fn claim_output(&self, path: &std::path::Path) -> bool {
+        self.produced.lock().unwrap().insert(path.to_path_buf())
+    }
+
+    /// Record a path as our own before writing to it, so a watch event for it
+    /// cannot race ahead of the record. For paths that cannot collide.
     pub fn mark_produced(&self, path: &std::path::Path) {
-        self.produced.lock().unwrap().insert(path.to_path_buf());
+        self.claim_output(path);
     }
 
     /// Did we write this path ourselves?

@@ -177,6 +177,7 @@ dependencies = [
  "scc",
  "smallvec",
  "tempfile",
+ "tiff",
  "winresource",
 ]
 

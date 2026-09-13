@@ -20,6 +20,16 @@ pub fn decoder_for(path: &Path, ext: FileType) -> Result<Box<dyn ImageDecoder>, 
     })
 }
 
+/// Does this TIFF hold more than one image? The `image` crate decodes only
+/// the first and says nothing about the rest. This reads the directory
+/// chain, not the pixels.
+pub fn tiff_has_more_pages(path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let file = BufReader::new(File::open(path)?);
+    let decoder = tiff::decoder::Decoder::new(file)?;
+
+    Ok(decoder.more_images())
+}
+
 pub fn conv2png(path: &Path, ext: FileType) -> Result<NamedTempFile, Box<dyn std::error::Error>> {
     let mut tmp = NamedTempFile::new()?;
 

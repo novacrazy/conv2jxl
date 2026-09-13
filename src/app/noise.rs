@@ -242,16 +242,29 @@ fn decodable(ext: FileType) -> bool {
     )
 }
 
-/// Was this JXL encoded lossily? `None` if the header could not be read, in
-/// which case the caller decides how cautious to be.
+/// What the conversion needs to know about a JPEG XL source before deciding
+/// to touch it.
+pub struct JxlInfo {
+    /// Was the encoder allowed to discard information? `None` if the file
+    /// ended before its first frame header, in which case the caller decides
+    /// how cautious to be.
+    pub lossy: Option<bool>,
+    pub animated: bool,
+}
+
+/// Read the header and stop the moment it is complete, a few KB off the
+/// front of the file whatever its size. That matters at archive scale: this
+/// runs on every JPEG XL the scan turns up, and shelling out to `jxlinfo` a
+/// few million times would cost more than all the real work.
 ///
-/// This reads the image header in-process and stops the moment it has it, a
-/// few KB off the front of the file, whatever the file's size. That matters
-/// at archive scale: the check runs on every JPEG XL the scan turns up, and
-/// shelling out to `jxlinfo` a few million times would cost more than all the
-/// real work.
-pub fn is_lossy_jxl(path: &Path) -> Option<bool> {
-    JxlSource::open(path).ok()?.is_lossy()
+/// `None` if the header could not be read at all.
+pub fn inspect_jxl(path: &Path) -> Option<JxlInfo> {
+    let source = JxlSource::open(path).ok()?;
+
+    Some(JxlInfo {
+        lossy: source.is_lossy(),
+        animated: source.is_animated(),
+    })
 }
 
 /// A JPEG XL file with its header decoded and the rest still unread. The
@@ -363,6 +376,10 @@ impl JxlSource {
         let frame = self.image.frame_header(0)?;
 
         Some(frame.encoding == jxl_oxide::frame::Encoding::VarDct)
+    }
+
+    fn is_animated(&self) -> bool {
+        self.image.image_header().metadata.animation.is_some()
     }
 
     /// Feed the rest of the file and hand back the decoder, ready to render.

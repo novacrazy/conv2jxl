@@ -21,6 +21,8 @@ scc = "3.0.4"
 smallvec = "1.15.1"
 boxcar = "0.2"
 jxl-oxide = { version = "0.12.6", default-features = false }
+# the same tiff the image crate uses, for the multi-page check
+tiff = "0.11"
 
 [dependencies.image]
 version = "0.25.8"

@@ -41,6 +41,7 @@ pub struct Conv2JxlArgs {
     /// truncate source file instead of deleting it after conversion.
     /// This can be useful to avoid issues with hardlinks or if the source and destination are on different filesystems,
     /// or if you just want to know what the original file was without using extra space. This supersedes --delete if both are set.
+    /// Truncation reaches every hard link of the file. A symlink source is left untouched rather than truncated through.
     #[argh(switch, short = 'T')]
     pub truncate: bool,
 
@@ -57,6 +58,8 @@ pub struct Conv2JxlArgs {
     /// if set, use this quality setting when the conversion is deemed inefficient (i.e., results in a larger file).
     /// This can be used to try to get a smaller file size for images that do not compress well at the normal quality setting.
     /// These often include images that include random noise.
+    /// Never applied to JPEG XL sources, which are re-encoded in place: a lossless one that does not shrink would
+    /// otherwise be replaced by a lossy one.
     #[argh(option, short = 'Q')]
     pub quality_if_inefficient: Option<u8>,
 

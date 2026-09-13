@@ -177,6 +177,14 @@ impl ConversionState {
                 break;
             }
 
+            // An in-place re-encode never falls back to a lower quality. A
+            // lossless JPEG XL made at effort 9 is almost always larger when
+            // re-encoded at a lower effort, so with a fallback this would turn
+            // a lossless archive lossy nearly file by file.
+            if src.ext == FileType::JXL {
+                break;
+            }
+
             // if there is a fallback quality for inefficient conversions
             let Some(quality_if_inefficient) = args.quality_if_inefficient else {
                 break;
@@ -216,21 +224,39 @@ impl ConversionState {
         let conv_start = Instant::now();
 
         // A JPEG XL source is re-encoded _in place_: "foo.jxl.jxl" is nonsense,
-        // and with -X the output path would be the input path, which would have
-        // cjxl writing over the file it is reading. Encode to a sibling temp
-        // file instead and swap it in only once the result is accepted.
+        // and with -X the output path would be the input path.
         let in_place = src.ext == FileType::JXL;
 
-        let output_path = match (in_place, args.no_preserve_extension) {
-            (true, _) => src.path.with_extension(format!("jxl.tmp{}-{i}", std::process::id())),
+        let final_path = match (in_place, args.no_preserve_extension) {
+            (true, _) => src.path.clone(),
             (false, false) => src.path.with_extension(format!("{}.jxl", src.ext)),
             (false, true) => src.path.with_extension("jxl"),
         };
 
-        if !in_place && output_path.exists() && !args.overwrite {
+        // cjxl writes to a sibling temp file, which is renamed over the final
+        // path only once the result is accepted. So a run that dies mid-encode
+        // leaves a `.tmp` next to the source rather than a truncated output
+        // that the next run would skip as already done, and an in-place
+        // re-encode never has cjxl reading and writing the same file.
+        let output_path = final_path.with_extension(format!("jxl.tmp{}-{i}", std::process::id()));
+
+        if !in_place && final_path.exists() && !args.overwrite {
             let last_active =
                 src.set_state(program_start, ConversionOutcome::Skipped("output already exists".into()));
             self.add_skipped(i, last_active); // skipped files are considered non-success for UI purposes
+            return None;
+        }
+
+        // Two sources can map to one output: `foo.png` and `foo.jpg` under
+        // `-X`. Without this the second would encode over the first's result,
+        // and under `--delete` both sources would be gone. A retry is the same
+        // source and already holds the claim.
+        if !retried && !self.claim_output(&final_path) {
+            let last_active = src.set_state(
+                program_start,
+                ConversionOutcome::Skipped("another source produces the same output path".into()),
+            );
+            self.add_skipped(i, last_active);
             return None;
         }
 
@@ -271,15 +297,28 @@ impl ConversionState {
         // an unreadable header means skipping, since guessing wrong there costs
         // image quality. Without it the only risk is wasted work that
         // --min-ratio would undo anyway, so an unreadable header proceeds.
-        if in_place
-            && !args.reencode_lossy_jxl
-            && args.quality_if_noisy.is_none()
-            && super::noise::is_lossy_jxl(&src.path) == Some(true)
-        {
-            let last_active =
-                src.set_state(program_start, ConversionOutcome::Skipped("already a lossy JPEG XL".into()));
-            self.add_skipped(i, last_active);
-            return None;
+        if in_place {
+            let info = super::noise::inspect_jxl(&src.path);
+
+            // The noise pass judges frame 0 alone, and whether cjxl carries an
+            // animation through a JPEG XL re-encode is untested. Replacing the
+            // file on a guess is not worth what it would save.
+            if info.as_ref().is_some_and(|info| info.animated) {
+                let last_active =
+                    src.set_state(program_start, ConversionOutcome::Skipped("animated JPEG XL".into()));
+                self.add_skipped(i, last_active);
+                return None;
+            }
+
+            if !args.reencode_lossy_jxl
+                && args.quality_if_noisy.is_none()
+                && info.is_some_and(|info| info.lossy == Some(true))
+            {
+                let last_active =
+                    src.set_state(program_start, ConversionOutcome::Skipped("already a lossy JPEG XL".into()));
+                self.add_skipped(i, last_active);
+                return None;
+            }
         }
 
         // Decide whether this image is carrying a random-noise overlay and, if
@@ -342,13 +381,30 @@ impl ConversionState {
             }
         }
 
-        // Claim the paths we are about to write before writing them, so the
-        // watcher can tell our own output from a file someone else dropped in.
-        if args.watch {
-            self.mark_produced(&output_path);
+        // The final path was claimed above. The temp path is ours too, so the
+        // watcher can tell it from a file someone else dropped in.
+        self.mark_produced(&output_path);
 
-            if in_place {
-                self.mark_produced(&src.path);
+        // The `image` crate decodes the first page of a TIFF and drops the
+        // rest without a word. Converting that and then deleting the source
+        // would lose every other page, so leave multi-page files alone.
+        if src.ext == FileType::TIFF {
+            match super::conv2png::tiff_has_more_pages(&src.path) {
+                Ok(false) => {}
+                Ok(true) => {
+                    let last_active =
+                        src.set_state(program_start, ConversionOutcome::Skipped("multi-page TIFF".into()));
+                    self.add_skipped(i, last_active);
+                    return None;
+                }
+                Err(e) => {
+                    let last_active = src.set_state(
+                        program_start,
+                        ConversionOutcome::Error(format!("Failed to read TIFF directory: {e}").into()),
+                    );
+                    self.add_error(i, last_active);
+                    return None;
+                }
             }
         }
 
@@ -604,28 +660,45 @@ impl ConversionState {
 
         drop(file); // close before renaming or changing attributes by path
 
-        if in_place {
-            // Swap the accepted re-encode over the original. std's rename maps
-            // to MoveFileEx with MOVEFILE_REPLACE_EXISTING on Windows, so this
-            // is a single atomic replacement rather than a delete-then-write
-            // window where the original is gone.
-            if let Err(e) = std::fs::rename(&output_path, &src.path) {
-                let _ = std::fs::remove_file(&output_path);
+        // The existence check at the top has a window: another instance, or a
+        // watcher, may have produced this output since. Look again before
+        // the rename makes it moot.
+        if !in_place && !args.overwrite && final_path.exists() {
+            let _ = std::fs::remove_file(&output_path);
 
-                let last_active = src.set_state(
-                    program_start,
-                    ConversionOutcome::Error(format!("Failed to replace the original file: {e}").into()),
-                );
+            let last_active =
+                src.set_state(program_start, ConversionOutcome::Skipped("output already exists".into()));
+            self.add_skipped(i, last_active);
+            return None;
+        }
 
-                self.add_error(i, last_active);
+        // Move the accepted encode to its final name. std's rename maps to
+        // MoveFileEx with MOVEFILE_REPLACE_EXISTING on Windows, so for an
+        // in-place re-encode this is a single atomic replacement rather than a
+        // delete-then-write window where the original is gone.
+        if let Err(e) = std::fs::rename(&output_path, &final_path) {
+            let _ = std::fs::remove_file(&output_path);
 
-                return None;
-            }
+            let last_active = src.set_state(
+                program_start,
+                ConversionOutcome::Error(format!("Failed to move the converted file into place: {e}").into()),
+            );
+
+            self.add_error(i, last_active);
+
+            return None;
         }
 
         // an in-place re-encode has no separate source left to remove
-        if !in_place && (args.delete || args.truncate) && src.path != output_path {
-            if args.truncate {
+        if !in_place && (args.delete || args.truncate) && src.path != final_path {
+            // Opening for write follows a symlink, so truncating one would
+            // zero the target, which may live anywhere. Deleting removes only
+            // the link, which is what the flag means for a link.
+            let is_link = std::fs::symlink_metadata(&src.path).is_ok_and(|m| m.is_symlink());
+
+            if args.truncate && is_link {
+                warning = Some("Source is a symlink and was left untouched instead of truncated".into());
+            } else if args.truncate {
                 // truncating requires opening the file for writing, and then setting times if available,
                 // because otherwise the modified time would be updated to now, which interferes with
                 // some users' workflows
@@ -697,5 +770,242 @@ impl ConversionState {
 
         self.progress.get(src.ext).add(input, output, elapsed);
         self.logs.outcome(src);
+    }
+}
+
+/// These drive one worker through the real scan-and-convert path against a
+/// temp directory, with cjxl doing the encodes. They pass trivially without
+/// cjxl on PATH, and say so.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::scan::ScanObserver;
+    use image::ImageEncoder as _;
+    use std::{fs::File, path::Path};
+
+    fn have_cjxl() -> bool {
+        let ok = std::process::Command::new("cjxl").arg("--version").output().is_ok();
+
+        if !ok {
+            println!("cjxl not on PATH, skipping");
+        }
+
+        ok
+    }
+
+    /// 64x64 RGB gradient: smooth, so a lossless encode is well under the
+    /// source size and `--min-ratio 1.0` accepts it.
+    fn pixels() -> Vec<u8> {
+        (0..64 * 64u32)
+            .flat_map(|i| [((i % 64) * 4) as u8, ((i / 64) * 4) as u8, 128])
+            .collect()
+    }
+
+    fn write_png(path: &Path) {
+        image::codecs::png::PngEncoder::new(File::create(path).unwrap())
+            .write_image(&pixels(), 64, 64, image::ExtendedColorType::Rgb8)
+            .unwrap();
+    }
+
+    fn write_bmp(path: &Path) {
+        let mut file = File::create(path).unwrap();
+        image::codecs::bmp::BmpEncoder::new(&mut file)
+            .write_image(&pixels(), 64, 64, image::ExtendedColorType::Rgb8)
+            .unwrap();
+    }
+
+    fn write_tiff(path: &Path, pages: usize) {
+        let mut encoder = tiff::encoder::TiffEncoder::new(File::create(path).unwrap()).unwrap();
+
+        for _ in 0..pages {
+            encoder
+                .write_image::<tiff::encoder::colortype::RGB8>(64, 64, &pixels())
+                .unwrap();
+        }
+    }
+
+    fn prepare(dir: &Path, flags: &[&str]) -> Arc<SharedState> {
+        let mut argv: Vec<&str> = vec!["-p", "1"];
+        argv.extend_from_slice(flags);
+        argv.push(dir.to_str().unwrap());
+
+        let mut args = <Conv2JxlArgs as argh::FromArgs>::from_args(&["conv2jxl"], &argv).unwrap();
+        args.normalize();
+
+        let conv = args.scan(&ScanObserver::default());
+
+        Arc::new(SharedState {
+            args,
+            conv,
+            start: Instant::now(),
+        })
+    }
+
+    /// Scan `dir` with the given flags and run every file on one worker.
+    fn run(dir: &Path, flags: &[&str]) -> Arc<SharedState> {
+        let shared = prepare(dir, flags);
+        shared.run(0);
+        shared
+    }
+
+    /// Like [`run`] for a directory with one matching file, stopping right
+    /// after it so the worker slot still shows that file's last attempt.
+    fn run_one(dir: &Path, flags: &[&str]) -> Arc<SharedState> {
+        let shared = prepare(dir, flags);
+        assert_eq!(shared.conv.files.count(), 1);
+
+        let mut stop = false;
+        shared.conv.next_file(0, &shared.args, shared.start, &mut stop);
+
+        shared
+    }
+
+    fn outcome<'a>(shared: &'a SharedState, name: &str) -> &'a ConversionOutcome {
+        shared
+            .conv
+            .files
+            .iter()
+            .find(|(_, f)| f.path.file_name().is_some_and(|n| n == name))
+            .unwrap_or_else(|| panic!("{name} was not scanned"))
+            .1
+            .state
+            .get()
+            .unwrap_or_else(|| panic!("{name} has no outcome"))
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn same_stem_sources_do_not_collide() {
+        if !have_cjxl() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_png(&dir.path().join("a.png"));
+        write_bmp(&dir.path().join("a.bmp"));
+
+        // A dry run writes nothing, so the second source cannot be stopped by
+        // the output already existing. Only the claim can stop it, which is
+        // the situation two parallel workers are in.
+        let shared = run(dir.path(), &["-X", "--ext", "png,bmp", "--dry-run"]);
+
+        let skipped: Vec<&str> = ["a.png", "a.bmp"]
+            .iter()
+            .filter_map(|n| match outcome(&shared, n) {
+                ConversionOutcome::Skipped(why) => Some(&**why),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(skipped, ["another source produces the same output path"]);
+
+        // For real: one converts, the other backs off, and nothing is lost.
+        let shared = run(dir.path(), &["-X", "--ext", "png,bmp", "--delete"]);
+
+        let (png, bmp) = (outcome(&shared, "a.png"), outcome(&shared, "a.bmp"));
+
+        let (won, lost) = match (png, bmp) {
+            (ConversionOutcome::Success(..), ConversionOutcome::Skipped(..)) => ("a.png", "a.bmp"),
+            (ConversionOutcome::Skipped(..), ConversionOutcome::Success(..)) => ("a.bmp", "a.png"),
+            other => panic!("expected one success and one skip, got {:?}", other_names(other)),
+        };
+
+        assert!(!dir.path().join(won).exists(), "{won} should have been deleted");
+        assert!(dir.path().join(lost).exists(), "{lost} must survive");
+        assert!(dir.path().join("a.jxl").exists());
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    fn describe(o: &ConversionOutcome) -> String {
+        match o {
+            ConversionOutcome::Success(i, o) => format!("Success({i} -> {o})"),
+            ConversionOutcome::Warning(i, o, w) => format!("Warning({i} -> {o}, {w})"),
+            ConversionOutcome::Skipped(why) => format!("Skipped({why})"),
+            ConversionOutcome::Error(e) => format!("Error({e})"),
+            ConversionOutcome::Inefficient(i, o) => format!("Inefficient({i} -> {o})"),
+        }
+    }
+
+    fn other_names(o: (&ConversionOutcome, &ConversionOutcome)) -> (String, String) {
+        (describe(o.0), describe(o.1))
+    }
+
+    #[test]
+    fn rejected_output_leaves_nothing_behind() {
+        if !have_cjxl() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_png(&dir.path().join("a.png"));
+
+        // --min-ratio 0 makes every encode inefficient
+        let shared = run(dir.path(), &["--min-ratio", "0"]);
+
+        assert!(matches!(outcome(&shared, "a.png"), ConversionOutcome::Inefficient(..)));
+        assert!(!dir.path().join("a.png.jxl").exists());
+        assert!(dir.path().join("a.png").exists());
+        assert!(leftovers(dir.path()).is_empty());
+
+        // and an accepted one lands at the final name with no temp left
+        let shared = run(dir.path(), &[]);
+
+        assert!(matches!(outcome(&shared, "a.png"), ConversionOutcome::Success(..)));
+        assert!(dir.path().join("a.png.jxl").exists());
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn in_place_reencode_never_takes_the_lossy_fallback() {
+        if !have_cjxl() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_png(&dir.path().join("a.png"));
+        run(dir.path(), &["-X"]);
+
+        let jxl = dir.path().join("a.jxl");
+        let before = std::fs::read(&jxl).unwrap();
+
+        // Every encode is inefficient, and a fallback quality is offered.
+        // A PNG source takes it. A JPEG XL source must not.
+        let shared = run_one(dir.path(), &["--ext", "jxl", "--min-ratio", "0", "-Q", "50"]);
+
+        assert!(matches!(outcome(&shared, "a.jxl"), ConversionOutcome::Inefficient(..)));
+        assert_eq!(shared.conv.active[0].quality.load(Ordering::Relaxed), 100, "retried at -Q");
+        assert_eq!(std::fs::read(&jxl).unwrap(), before, "file was touched");
+        assert!(leftovers(dir.path()).is_empty());
+
+        let shared = run_one(dir.path(), &["--ext", "png", "--min-ratio", "0", "-Q", "50"]);
+
+        let png = outcome(&shared, "a.png");
+        assert!(matches!(png, ConversionOutcome::Inefficient(..)), "{}", describe(png));
+        assert_eq!(shared.conv.active[0].quality.load(Ordering::Relaxed), 50, "PNG should have retried");
+    }
+
+    #[test]
+    fn multi_page_tiff_is_skipped() {
+        if !have_cjxl() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_tiff(&dir.path().join("one.tiff"), 1);
+        write_tiff(&dir.path().join("two.tiff"), 2);
+
+        let shared = run(dir.path(), &["--ext", "tiff", "--delete"]);
+
+        assert!(matches!(outcome(&shared, "one.tiff"), ConversionOutcome::Success(..)));
+        assert!(matches!(outcome(&shared, "two.tiff"), ConversionOutcome::Skipped(why) if &**why == "multi-page TIFF"));
+        assert!(dir.path().join("two.tiff").exists(), "the multi-page source must survive --delete");
+        assert!(!dir.path().join("two.tiff.jxl").exists());
     }
 }
