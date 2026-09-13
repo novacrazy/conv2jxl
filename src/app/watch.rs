@@ -277,7 +277,7 @@ fn build_entry(
         .and_then(OsStr::to_str)
         .and_then(|s| FileType::from_str(s).ok())?;
 
-    if !args.extensions.contains(&ext) {
+    if !args.extensions.contains(&ext) || args.skip_by_name(path, ext) {
         return None;
     }
 

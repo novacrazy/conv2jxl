@@ -124,6 +124,8 @@ pub struct Conv2JxlArgs {
     /// since that stacks generation loss. Leaving it off is also what makes
     /// repeated runs over the same directory idempotent, and what stops a
     /// watcher from re-processing output another instance just wrote.
+    /// Without it, files named `.jpg.jxl` or `.jpeg.jxl` are not scanned at
+    /// all, since by name they are recompressed JPEGs.
     #[argh(switch)]
     pub reencode_lossy_jxl: bool,
 

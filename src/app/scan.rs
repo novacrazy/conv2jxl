@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, str::FromStr as _};
+use std::{ffi::OsStr, path::Path, str::FromStr as _};
 
 use crate::cli::{Conv2JxlArgs, SortMethod, SortOrder};
 
@@ -14,7 +14,8 @@ pub struct FileScanObserver {
 pub struct ScanObserver {
     pub dir_read: AtomicU64,
     pub dir_found: AtomicU64,
-    /// Entries skipped by --filter / --exclude regexes.
+    /// Entries skipped by --filter / --exclude regexes, or by name as
+    /// recompressed JPEGs (see [`Conv2JxlArgs::skip_by_name`]).
     pub excluded: AtomicU64,
     /// Directories or entries skipped due to I/O errors.
     pub errors: AtomicU64,
@@ -35,7 +36,27 @@ impl ScanObserver {
     }
 }
 
+/// `foo.jpg.jxl` or `foo.jpeg.jxl`, in any case. The inner extension is how
+/// this tool (and most others) name a recompressed JPEG.
+fn is_recompressed_jpeg_name(path: &Path) -> bool {
+    path.file_stem()
+        .map(Path::new)
+        .and_then(Path::extension)
+        .and_then(OsStr::to_str)
+        .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"))
+}
+
 impl Conv2JxlArgs {
+    /// Leave out a JPEG XL source whose name marks it as a recompressed JPEG.
+    /// Those are VarDCT, so lossy, and the header check would skip them
+    /// anyway. Deciding here saves opening every one of them.
+    ///
+    /// A file that is named that way but holds a lossless encode is missed,
+    /// which costs a skipped opportunity and never a file.
+    pub fn skip_by_name(&self, path: &Path, ext: FileType) -> bool {
+        ext == FileType::JXL && !self.reencode_lossy_jxl && is_recompressed_jpeg_name(path)
+    }
+
     pub fn normalize(&mut self) {
         self.threads = self.threads.clamp(-1, i32::MAX);
         self.quality = self.quality.clamp(0, 100);
@@ -117,6 +138,11 @@ impl Conv2JxlArgs {
                     continue;
                 }
 
+                if self.skip_by_name(&path, ext) {
+                    observer.excluded.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
                 let f = observer.files.get(ext);
 
                 f.found.fetch_add(1, Ordering::Relaxed);
@@ -129,8 +155,6 @@ impl Conv2JxlArgs {
                 observer.dir_found.fetch_add(1, Ordering::Relaxed);
             }
         }
-
-        let mut excluded = 0;
 
         while let Some((depth, path)) = pending_dirs.pop() {
             if observer.cancelled() {
@@ -206,7 +230,6 @@ impl Conv2JxlArgs {
                     && (matches!(filter, Some(ref filter) if !filter.is_match(path))
                         || matches!(exclude, Some(ref exclude) if exclude.is_match(path)))
                 {
-                    excluded += 1;
                     observer.excluded.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -256,6 +279,12 @@ impl Conv2JxlArgs {
                 // Some() for every path that reaches here: plain files got it
                 // from the pre-metadata check, followed links from the re-check
                 let Some(ext) = ext else { continue };
+
+                // before the metadata call, which is the expensive part here
+                if self.skip_by_name(&path, ext) {
+                    observer.excluded.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
 
                 let metadata = match metadata {
                     Some(m) => m,
@@ -363,7 +392,7 @@ impl Conv2JxlArgs {
         }
 
         ConversionState {
-            excluded,
+            excluded: observer.excluded.load(Ordering::Relaxed) as usize,
             files: concurrent_files,
             idx: AtomicUsize::new(0),
             active: Vec::from_iter((0..self.parallel).map(|_| ThreadState {
@@ -379,5 +408,51 @@ impl Conv2JxlArgs {
             produced: Default::default(),
             logs: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scanned(dir: &Path, flags: &[&str]) -> (Vec<String>, u64) {
+        let mut argv: Vec<&str> = flags.to_vec();
+        argv.push(dir.to_str().unwrap());
+
+        let mut args = <Conv2JxlArgs as argh::FromArgs>::from_args(&["conv2jxl"], &argv).unwrap();
+        args.normalize();
+
+        let observer = ScanObserver::default();
+        let state = args.scan(&observer);
+
+        let mut names: Vec<String> = state
+            .files
+            .iter()
+            .map(|(_, f)| f.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+
+        (names, observer.excluded.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn recompressed_jpegs_are_skipped_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // contents do not matter, the scan never opens them
+        for name in ["a.jpeg.jxl", "b.JPG.jxl", "c.png.jxl", "d.jxl", "e.jpg.png"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+
+        assert_eq!(
+            scanned(dir.path(), &["--ext", "jxl"]),
+            (vec!["c.png.jxl".to_owned(), "d.jxl".to_owned()], 2)
+        );
+
+        // the override brings them back
+        assert_eq!(scanned(dir.path(), &["--ext", "jxl", "--reencode-lossy-jxl"]).0.len(), 4);
+
+        // other formats are untouched by the rule, whatever their inner extension
+        assert_eq!(scanned(dir.path(), &["--ext", "png"]), (vec!["e.jpg.png".to_owned()], 0));
     }
 }
