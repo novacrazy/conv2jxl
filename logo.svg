@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 168 168" width="168" height="168" role="img" aria-labelledby="t">
+  <title id="t">conv2jxl</title>
+
+  <defs>
+    <linearGradient id="smooth" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"   stop-color="#a855f7"/>
+      <stop offset="0.5" stop-color="#22d3ee"/>
+      <stop offset="1"   stop-color="#34d399"/>
+    </linearGradient>
+  </defs>
+
+  <!-- tile (the image being converted) -->
+  <rect x="4" y="4" width="160" height="160" rx="18"
+        fill="#0b1220" stroke="#22d3ee" stroke-width="2.5"/>
+
+  <!-- pixel grid (source raster) in the top-left -->
+  <g>
+    <rect x="20" y="20" width="18" height="18" fill="#67e8f9"/>
+    <rect x="38" y="20" width="18" height="18" fill="#22d3ee"/>
+    <rect x="56" y="20" width="18" height="18" fill="#0891b2"/>
+    <rect x="74" y="20" width="18" height="18" fill="#0e7490" opacity="0.7"/>
+
+    <rect x="20" y="38" width="18" height="18" fill="#22d3ee"/>
+    <rect x="38" y="38" width="18" height="18" fill="#0891b2"/>
+    <rect x="56" y="38" width="18" height="18" fill="#0e7490" opacity="0.7"/>
+    <rect x="74" y="38" width="18" height="18" fill="#155e75" opacity="0.55"/>
+
+    <rect x="20" y="56" width="18" height="18" fill="#0891b2"/>
+    <rect x="38" y="56" width="18" height="18" fill="#0e7490" opacity="0.7"/>
+    <rect x="56" y="56" width="18" height="18" fill="#155e75" opacity="0.45"/>
+
+    <rect x="20" y="74" width="18" height="18" fill="#0e7490" opacity="0.55"/>
+    <rect x="38" y="74" width="18" height="18" fill="#155e75" opacity="0.35"/>
+  </g>
+
+  <!-- a few stray pixels disintegrating into the transition zone -->
+  <g fill="#22d3ee">
+    <rect x="74" y="56" width="8" height="8" opacity="0.6"/>
+    <rect x="86" y="68" width="6" height="6" opacity="0.45"/>
+    <rect x="56" y="74" width="6" height="6" opacity="0.4"/>
+  </g>
+
+  <!-- smooth "compressed" form in the bottom-right -->
+  <path d="M 76 88
+           C 106 78, 144 94, 148 124
+           C 152 150, 124 158, 94 150
+           C 66 142, 56 94, 76 88 Z"
+        fill="url(#smooth)" opacity="0.95"/>
+  <ellipse cx="104" cy="108" rx="22" ry="6" fill="#ffffff" opacity="0.18"/>
+
+  <!-- JXL wordmark, top-right of tile -->
+  <g font-family="'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace"
+     font-weight="800" font-size="22" letter-spacing="2" fill="#fbbf24">
+    <text x="102" y="30">JXL</text>
+  </g>
+</svg>

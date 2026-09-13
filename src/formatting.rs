@@ -160,3 +160,68 @@ impl Display for Speed {
 pub fn strip_non_ascii(s: String, replacement: Option<&str>) -> String {
     s.replace(|c: char| !c.is_ascii(), replacement.unwrap_or("?"))
 }
+
+/// Wall-clock time printed as UTC `2026-09-12T14:03:05Z`, for log lines.
+///
+/// UTC because local time needs a timezone database, which is a dependency
+/// this tool does not otherwise want.
+#[derive(Debug, Clone, Copy)]
+pub struct Timestamp(pub std::time::SystemTime);
+
+impl Timestamp {
+    pub fn now() -> Self {
+        Timestamp(std::time::SystemTime::now())
+    }
+}
+
+impl Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secs = self
+            .0
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+        let s = secs.rem_euclid(86_400);
+
+        write!(
+            f,
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            s / 3600,
+            (s / 60) % 60,
+            s % 60
+        )
+    }
+}
+
+/// Days since 1970-01-01 to a proleptic Gregorian (year, month, day).
+/// Howard Hinnant's `civil_from_days`, valid for any i64 day count.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + (m <= 2) as i64;
+
+    (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_formats_utc() {
+        let t = Timestamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_757_685_785));
+        assert_eq!(t.to_string(), "2025-09-12T14:03:05Z");
+
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+}

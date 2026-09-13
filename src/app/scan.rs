@@ -14,7 +14,25 @@ pub struct FileScanObserver {
 pub struct ScanObserver {
     pub dir_read: AtomicU64,
     pub dir_found: AtomicU64,
+    /// Entries skipped by --filter / --exclude regexes.
+    pub excluded: AtomicU64,
+    /// Directories or entries skipped due to I/O errors.
+    pub errors: AtomicU64,
     pub files: PerFileType<FileScanObserver>,
+    /// Directory currently being read, for the live "Current:" line.
+    pub current: Mutex<PathBuf>,
+    /// Set by the UI to request the scan abort early.
+    pub cancel: std::sync::atomic::AtomicBool,
+}
+
+impl ScanObserver {
+    fn err(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 impl Conv2JxlArgs {
@@ -24,6 +42,12 @@ impl Conv2JxlArgs {
         self.effort = self.effort.clamp(0, 10);
         self.randomize = self.randomize.clamp(0.0, 1.0);
         self.min_ratio = self.min_ratio.max(0.0);
+        self.quality_if_inefficient = self.quality_if_inefficient.map(|q| q.min(100));
+        self.quality_if_noisy = self.quality_if_noisy.map(|q| q.min(100));
+        self.noise_threshold = self.noise_threshold.max(0.0);
+        self.noise_coverage = self.noise_coverage.clamp(0.0, 1.0);
+        self.noise_whiteness = self.noise_whiteness.max(0.0);
+        self.noise_min_bpp = self.noise_min_bpp.max(0.0);
         self.min_size = self.min_size.max(1); // always exclude empty files
 
         // ensure min_size <= max_size
@@ -41,9 +65,15 @@ impl Conv2JxlArgs {
         }
     }
 
-    pub fn scan(&self, observer: &ScanObserver) -> Result<ConversionState, Box<dyn std::error::Error>> {
-        let filter = self.filter.as_ref().map(|s| regex::Regex::new(s)).transpose()?;
-        let exclude = self.exclude.as_ref().map(|s| regex::Regex::new(s)).transpose()?;
+    /// Walk the requested paths and build the [`ConversionState`].
+    ///
+    /// This is intentionally infallible: per-directory and per-entry I/O errors
+    /// are skipped and tallied in `observer.errors` rather than aborting the
+    /// whole scan. Regex patterns are validated by the caller before this runs,
+    /// so an invalid pattern here is simply treated as absent.
+    pub fn scan(&self, observer: &ScanObserver) -> ConversionState {
+        let filter = self.filter.as_deref().and_then(|s| regex::Regex::new(s).ok());
+        let exclude = self.exclude.as_deref().and_then(|s| regex::Regex::new(s).ok());
 
         let mut visited = std::collections::HashSet::<PathBuf, _>::with_capacity_and_hasher(
             1024,
@@ -55,17 +85,24 @@ impl Conv2JxlArgs {
         let mut pending_dirs = Vec::new();
 
         for path in &self.paths {
-            let path = path.canonicalize()?;
-
-            let mut metadata = std::fs::metadata(&path)?;
-
-            if metadata.is_symlink() {
-                if !self.follow_links {
-                    continue;
-                }
-
-                metadata = std::fs::symlink_metadata(&path)?;
+            // Check link-ness on the path as given: `canonicalize` resolves
+            // symlinks, and `fs::metadata` follows them, so both would report
+            // the target and `is_symlink()` would never be true.
+            if !self.follow_links
+                && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink())
+            {
+                continue;
             }
+
+            let Ok(path) = path.canonicalize() else {
+                observer.err();
+                continue;
+            };
+
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                observer.err();
+                continue;
+            };
 
             if metadata.is_file() && (self.min_size..=self.max_size).contains(&metadata.len()) {
                 let Some(ext) = path
@@ -96,17 +133,54 @@ impl Conv2JxlArgs {
         let mut excluded = 0;
 
         while let Some((depth, path)) = pending_dirs.pop() {
+            if observer.cancelled() {
+                break;
+            }
+
             observer.dir_read.fetch_add(1, Ordering::Relaxed);
 
             if depth > self.max_depth {
                 continue;
             }
 
+            if let Ok(mut current) = observer.current.lock() {
+                current.clone_from(&path);
+            }
+
+            // optionally simulate a slow scan so the scan UI can be exercised.
+            // Sleep in small chunks so a cancel stays responsive.
+            if self.dry_run && self.dry_run_delay > 0 {
+                let mut remaining = self.dry_run_delay;
+                while remaining > 0 {
+                    let chunk = remaining.min(50);
+                    std::thread::sleep(std::time::Duration::from_millis(chunk));
+                    remaining -= chunk;
+
+                    if observer.cancelled() {
+                        break;
+                    }
+                }
+            }
+
             current_files.clear();
 
-            for entry in std::fs::read_dir(&path)? {
-                let entry = entry?;
-                let mut ft = entry.file_type()?;
+            let read_dir = match std::fs::read_dir(&path) {
+                Ok(rd) => rd,
+                Err(_) => {
+                    observer.err();
+                    continue;
+                }
+            };
+
+            for entry in read_dir {
+                let Ok(entry) = entry else {
+                    observer.err();
+                    continue;
+                };
+                let Ok(mut ft) = entry.file_type() else {
+                    observer.err();
+                    continue;
+                };
 
                 // avoid computing metadata unless necessary
                 let mut ext = None;
@@ -133,6 +207,7 @@ impl Conv2JxlArgs {
                         || matches!(exclude, Some(ref exclude) if exclude.is_match(path)))
                 {
                     excluded += 1;
+                    observer.excluded.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
@@ -141,9 +216,29 @@ impl Conv2JxlArgs {
                         continue;
                     }
 
-                    let new_metadata = std::fs::symlink_metadata(&path)?;
+                    // `fs::metadata` follows the link; `symlink_metadata` would
+                    // just describe the link again and nothing would ever be
+                    // followed.
+                    let Ok(new_metadata) = std::fs::metadata(&path) else {
+                        observer.err();
+                        continue;
+                    };
                     ft = new_metadata.file_type();
                     metadata = Some(new_metadata);
+
+                    // the extension check above only ran for entries that were
+                    // already known to be files, so redo it for a link that
+                    // turned out to point at one
+                    if ft.is_file() {
+                        ext = match path
+                            .extension()
+                            .and_then(OsStr::to_str)
+                            .and_then(|s| FileType::from_str(s).ok())
+                        {
+                            Some(ext) if self.extensions.contains(&ext) => Some(ext),
+                            _ => continue,
+                        };
+                    }
                 }
 
                 if ft.is_dir() {
@@ -158,11 +253,19 @@ impl Conv2JxlArgs {
                     continue;
                 }
 
-                let ext = ext.unwrap(); // must be Some() due to earlier check
+                // Some() for every path that reaches here: plain files got it
+                // from the pre-metadata check, followed links from the re-check
+                let Some(ext) = ext else { continue };
 
                 let metadata = match metadata {
                     Some(m) => m,
-                    None => entry.metadata()?,
+                    None => match entry.metadata() {
+                        Ok(m) => m,
+                        Err(_) => {
+                            observer.err();
+                            continue;
+                        }
+                    },
                 };
 
                 if !(self.min_size..=self.max_size).contains(&metadata.len()) {
@@ -203,9 +306,9 @@ impl Conv2JxlArgs {
         }
 
         if self.randomize > 0.0 {
-            use rand::{Rng, SeedableRng, rngs::SmallRng, seq::SliceRandom};
+            use rand::{RngExt as _, SeedableRng, rngs::SmallRng, seq::SliceRandom};
 
-            let mut rng = SmallRng::from_os_rng();
+            let mut rng = SmallRng::from_rng(&mut rand::rng());
 
             if self.randomize >= 1.0 {
                 files.shuffle(&mut rng);
@@ -236,7 +339,7 @@ impl Conv2JxlArgs {
             let progress = progress.get_mut(file.ext);
 
             *progress.total_bytes.get_mut() += file.metadata.len();
-            progress.total += 1;
+            *progress.total.get_mut() += 1;
 
             let (count, bytes) = final_counts.get_mut(file.ext);
 
@@ -251,17 +354,30 @@ impl Conv2JxlArgs {
             p.found.store(count, Ordering::Relaxed);
         }
 
-        Ok(ConversionState {
+        // Move the locally-built Vec into the concurrent, stable-indexed
+        // boxcar::Vec that workers (and the watcher's promoter, in watch mode)
+        // share. From here on, growth happens only via push from the promoter.
+        let concurrent_files: boxcar::Vec<FileEntry> = boxcar::Vec::new();
+        for entry in files {
+            concurrent_files.push(entry);
+        }
+
+        ConversionState {
             excluded,
-            files,
+            files: concurrent_files,
             idx: AtomicUsize::new(0),
             active: Vec::from_iter((0..self.parallel).map(|_| ThreadState {
                 file_idx: AtomicUsize::new(usize::MAX),
                 start_time: AtomicU64::new(0),
+                quality: AtomicU8::new(QUALITY_UNSET),
             })),
             non_success: Default::default(),
             progress,
             paused: Default::default(),
-        })
+            shutdown: Default::default(),
+            wake: Default::default(),
+            produced: Default::default(),
+            logs: Default::default(),
+        }
     }
 }

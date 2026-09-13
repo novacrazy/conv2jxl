@@ -17,7 +17,6 @@ pub struct Conv2JxlArgs {
     /// maximum recursion depth. Default is unlimited.
     /// Only applies if --recurse is set.
     /// A depth of 0 means only the given directories, 1 means their direct subdirectories, etc.
-    /// Note that --ignore-recent only applies to files in the direct subdirectories of the given paths, not further down.
     #[argh(option, default = "u64::MAX")]
     pub max_depth: u64,
 
@@ -45,6 +44,12 @@ pub struct Conv2JxlArgs {
     #[argh(switch, short = 'T')]
     pub truncate: bool,
 
+    /// after truncating a source file, also mark it as hidden. Windows only,
+    /// ignored on platforms with no hidden attribute.
+    /// Only applies if --truncate is set.
+    #[argh(switch, short = 'H')]
+    pub hide_truncated: bool,
+
     /// conversion quality, from 0 to 100, where 100 is lossless.
     #[argh(option, short = 'q', default = "100")]
     pub quality: u8,
@@ -52,7 +57,7 @@ pub struct Conv2JxlArgs {
     /// if set, use this quality setting when the conversion is deemed inefficient (i.e., results in a larger file).
     /// This can be used to try to get a smaller file size for images that do not compress well at the normal quality setting.
     /// These often include images that include random noise.
-    #[argh(option, short = 'Q')] // TODO!
+    #[argh(option, short = 'Q')]
     pub quality_if_inefficient: Option<u8>,
 
     /// if a file is inefficiently compressed (i.e., results in a file larger than required by --min-ratio),
@@ -64,6 +69,60 @@ pub struct Conv2JxlArgs {
     /// This can be used to avoid re-encoding small files that do not compress well.
     #[argh(option, short = 'I')]
     pub min_inefficient_size: Option<u64>,
+
+    /// if set, images found to be covered in random noise (film grain, "dust"
+    /// overlays and similar) are encoded at this quality instead of --quality,
+    /// which is where nearly all of their size comes from. Setting this enables
+    /// noise analysis. Without it no image is analyzed.
+    ///
+    /// Sources that are already JPEG XL are re-encoded in place (the original
+    /// is replaced), and only if the result is smaller than the original by
+    /// --min-ratio. JPEG XL files that are already lossy are left alone unless
+    /// --reencode-lossy-jxl is set. A JPEG XL the noise pass does not want is
+    /// skipped rather than losslessly re-encoded, so scanning a whole library
+    /// costs one decode per file and nothing more.
+    #[argh(option, short = 'N')]
+    pub quality_if_noisy: Option<u8>,
+
+    /// how strong the noise in a 32x32 block has to be, in 0-255 units, for
+    /// that block to count as noisy. Default 1.0. Lower catches fainter grain
+    /// at the cost of false positives.
+    /// Only applies if --quality-if-noisy is set.
+    #[argh(option, default = "1.0")]
+    pub noise_threshold: f32,
+
+    /// fraction of an image's blocks that must be noisy for the image to count
+    /// as noisy. Default 0.25, which allows for grain used as texture in only
+    /// part of a picture. Raise it to only catch whole-image grain.
+    #[argh(option, default = "0.25")]
+    pub noise_coverage: f32,
+
+    /// how white a block's noise has to be to count, as the ratio of its
+    /// full-resolution to half-resolution noise sigma. Random noise sits at
+    /// 2.0, while real detail survives downsampling and sits near 1.0. Default 1.6.
+    #[argh(option, default = "1.6")]
+    pub noise_whiteness: f32,
+
+    /// skip noise analysis for files already stored below this many bits per
+    /// pixel, which are either clean or already lossy. Default 2.0.
+    ///
+    /// This is calibrated for JPEG XL sources. Formats with weaker lossless
+    /// compression get proportionally more room before they are analyzed (3x
+    /// for PNG and friends), and formats that do not compress at all (BMP, TGA)
+    /// are always analyzed, since their size says nothing about their content.
+    #[argh(option, default = "2.0")]
+    pub noise_min_bpp: f32,
+
+    /// skip noise analysis for files smaller than this many bytes. Default 0.
+    #[argh(option, default = "0")]
+    pub noise_min_size: u64,
+
+    /// also re-encode JPEG XL sources that are already lossy. Off by default,
+    /// since that stacks generation loss. Leaving it off is also what makes
+    /// repeated runs over the same directory idempotent, and what stops a
+    /// watcher from re-processing output another instance just wrote.
+    #[argh(switch)]
+    pub reencode_lossy_jxl: bool,
 
     /// effort level, from 0 to 9, where 0 is fastest and 9 is best quality.
     /// 10 exists, but uses too much memory for most systems.
@@ -81,6 +140,12 @@ pub struct Conv2JxlArgs {
     /// perform a trial run with no changes made, just print what would be done.
     #[argh(switch)]
     pub dry_run: bool,
+
+    /// in dry-run mode, sleep this many milliseconds per file to simulate
+    /// encoding time. Useful for exercising the TUI without invoking cjxl.
+    /// Default is 0. Only applies if --dry-run is set.
+    #[argh(option, default = "0")]
+    pub dry_run_delay: u64,
 
     /// only convert files larger than this size in bytes. Default is 0 (no minimum).
     #[argh(option, short = 'm', default = "0")]
@@ -141,14 +206,14 @@ pub struct Conv2JxlArgs {
     #[argh(option)]
     pub exclude: Option<String>,
 
-    /// path to error log, for which errors will be appended
+    /// append every file's outcome to this file as the run goes, one line
+    /// each, followed by the final summary.
+    #[argh(option)]
+    pub log: Option<PathBuf>,
+
+    /// append only errors to this file as the run goes.
     #[argh(option)]
     pub error_log: Option<PathBuf>,
-
-    /// interval (in files processed) to print a summary of progress.
-    /// Default is no summary.
-    #[argh(option)]
-    pub summary_interval: Option<usize>,
 
     /// number of threads each conversion process should use.
     /// Use -1 to use all available threads, 0 (default) for single-threaded.
@@ -165,8 +230,8 @@ pub struct Conv2JxlArgs {
     pub progressive: bool,
 
     /// sort files before conversion.
-    /// Valid values are "none", "asc", "desc", "name", "mtime", "ctime", "atime".
-    /// "asc" and "desc" sort by file size. Default is "none".
+    /// Valid values are "none", "size", "name", "mtime", "ctime", "atime".
+    /// Use --sort-order for the direction. Default is "none".
     #[argh(option, short = 's', default = "SortMethod::None")]
     pub sort: SortMethod,
 
@@ -178,6 +243,18 @@ pub struct Conv2JxlArgs {
     /// where 0.0 means no randomization and 1.0 means full randomization
     #[argh(option, default = "0.0")]
     pub randomize: f64,
+
+    /// after the initial scan/convert, keep running and watch the input
+    /// directories for newly-created files matching the filters, converting
+    /// each one as it settles. Use --watch-debounce-ms to tune.
+    #[argh(switch, short = 'w')]
+    pub watch: bool,
+
+    /// in --watch mode, wait this many milliseconds after the last filesystem
+    /// event for a path before queueing it for conversion. Avoids picking up
+    /// files that are still being written. Default 500.
+    #[argh(option, default = "500")]
+    pub watch_debounce_ms: u64,
 
     /// paths to files or directories to convert.
     #[argh(positional, greedy)]
@@ -191,6 +268,53 @@ impl Conv2JxlArgs {
 
     pub fn height(&self) -> RangeInclusive<u32> {
         self.min_height..=self.max_height
+    }
+
+    /// Flag combinations that parse fine but do nothing, so the user can be
+    /// told before the run starts instead of wondering afterwards. Call after
+    /// [`Self::normalize`].
+    pub fn conflicts(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.hide_truncated && !self.truncate {
+            warnings.push("--hide-truncated has no effect without --truncate".to_owned());
+        }
+
+        if self.min_inefficient_size.is_some() && self.quality_if_inefficient.is_none() {
+            warnings.push("--min-inefficient-size has no effect without --quality-if-inefficient".to_owned());
+        }
+
+        if let Some(q) = self.quality_if_inefficient
+            && q >= self.quality
+        {
+            warnings.push(format!(
+                "--quality-if-inefficient {q} is not lower than --quality {}, so inefficient files will never be retried",
+                self.quality
+            ));
+        }
+
+        if let Some(q) = self.quality_if_noisy
+            && q >= self.quality
+        {
+            warnings.push(format!(
+                "--quality-if-noisy {q} is not lower than --quality {}, so noisy images will be analyzed but never encoded lower",
+                self.quality
+            ));
+        }
+
+        if self.dry_run_delay > 0 && !self.dry_run {
+            warnings.push("--dry-run-delay has no effect without --dry-run".to_owned());
+        }
+
+        if self.disable_jpeg_reconstruction && !self.lossless_jpeg {
+            warnings.push("--disable-jpeg-reconstruction has no effect with --lossless-jpeg false".to_owned());
+        }
+
+        if !self.recurse && (self.min_depth > 0 || self.max_depth != u64::MAX) {
+            warnings.push("--min-depth and --max-depth have no effect without --recurse".to_owned());
+        }
+
+        warnings
     }
 }
 
@@ -255,12 +379,34 @@ macro_rules! decl_filetypes {
                 FileType::all().iter().map(move |&ftype| (ftype, self.get(ftype)))
             }
 
-            pub fn map<F, U>(&self, f: F) -> PerFileType<U>
+            // pub fn iter_mut(&mut self) -> impl Iterator<Item = (FileType, &mut T)> {
+            //     let ptr = self as *mut PerFileType<T>;
+            //     FileType::all().iter().map(move |&ftype| unsafe {
+            //         (ftype, (&mut *ptr).get_mut(ftype))
+            //     })
+            // }
+
+            #[inline]
+            pub fn as_ref(&self) -> PerFileType<&T> {
+                PerFileType {
+                    $($variant: &self.$variant),*
+                }
+            }
+
+            #[inline]
+            pub fn as_mut(&mut self) -> PerFileType<&mut T> {
+                PerFileType {
+                    $($variant: &mut self.$variant),*
+                }
+            }
+
+            #[inline]
+            pub fn map<F, U>(self, f: F) -> PerFileType<U>
             where
-                F: Fn(&T) -> U,
+                F: Fn(T) -> U,
             {
                 PerFileType {
-                    $($variant: f(&self.$variant)),*
+                    $($variant: f(self.$variant)),*
                 }
             }
         }
@@ -371,7 +517,7 @@ impl FromStr for FileType {
     type Err = InvalidFileType;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        const PATTERNS: [(&str, FileType); 15] = [
+        const PATTERNS: [(&str, FileType); 16] = [
             ("jxl", FileType::JXL),
             ("ppm", FileType::PPM),
             ("pnm", FileType::PNM),
@@ -387,10 +533,11 @@ impl FromStr for FileType {
             ("tif", FileType::TIFF),
             ("tga", FileType::TGA),
             ("qoi", FileType::QOI),
+            ("bmp", FileType::BMP),
         ];
 
         for (pattern, ftype) in PATTERNS {
-            if s.eq_ignore_ascii_case(pattern) {
+            if s.trim().eq_ignore_ascii_case(pattern) {
                 return Ok(ftype);
             }
         }
@@ -446,6 +593,8 @@ impl FromStr for FileTypes {
                     // if * was specified, don't include JXL itself unless it was explicitly requested
                     set.remove(&FileType::JXL);
                 }
+
+                continue; // "*" is not itself a parseable file type
             }
 
             set.insert(part.parse::<FileType>()?);
